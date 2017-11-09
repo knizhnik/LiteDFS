@@ -1,0 +1,161 @@
+<html>
+<head>
+<title>LiteDFS - Lightweight Distributed File System</title>
+<ol>
+<li><a href="#overview">Overview</a></li>
+<li><a href="#client">DFS client</a></li>
+<li><a href="#server">DFS server</a></li>
+<li><a href="#usecases">Use cases</a></li>
+<li><a href="#license">License</a></li>
+<li><a href="html/index.html">API</a></li>
+</ol>
+</head>
+
+<body>
+<h2><a name="overview">Overview</a></h2>
+
+LiteDFS is a simple distributed file system with the following characteristics:
+<ul>
+<li>Oriented on manipulation with large bulks of data (chunks): default chunk size is 4Mb</li>
+<li>Provides abstraction of a flat file</li>
+<li>Works with raw partitions</li>
+<li>Allocation model: cyclic buffer. Data is never deallocated, when end of partition is reached, current position is moved to the begging of 
+the partition. So it is assumed that size of the storage is large enough to fit all data, either data is iteratively written in FIFO order 
+(new iteration can overwrite data written by previous iteration)</li>
+<li>No centralized metadata server: location of chunks is maintained by clients themselves</li>
+<li>Fault tolerance achieved by redundant storage of chunks</li>
+<li>DFS can be splitted in cliques to optimize network communications and provide uniform filling of the newly added nodes</li>
+<li>DFS nodes can be added on the fly</li>
+<li>System can survive failure of one or more DFS nodes (including corruption of disk)</li>
+<li>Recovery of crashed nodes is supported</li>
+</ul>
+
+<h2><a name="client">DFS client</a></h2>
+
+DFS client (process needed to work with large volumes of data) should use <code>DFSFile</code> class. 
+It provides standard set of operations with restriction that unit of write is always chunk (you can use
+<code>BufferedOutput</code> class to group data in chunks).
+It is possible to use virtual file handle interface (<code>VFileHandle</code>) which allows to work in the same way 
+with local Unix files and DFS files.<p>
+
+Client knows nothing about location of DFS nodes. Instead of it DFS nodes are connected to the clients.
+So client works with online subset of DFS nodes which are connected to it.
+When new chunk has to be written, a client randomly choose one (or more - depending of redundancy) of the nodes within clique and sends 
+chunk to it. DFS node replies with the offset of the chunk within node's storage. And finally client saves 
+position of the chunk (node identifier + offset within node) in its INODE table.<p>
+
+Example of DFS usage:
+
+<pre>
+    DFS::instance.listen("localhost:5101"); // spawn thread accepting connections of DFS nodes
+
+    DFSFile file;
+    VFileHandle* vfh;
+    if (useDfs) {         
+        file.open("inodetab.dfs", 0, DFS_INODE_TABLE_SIZE, DFS_CACHE_SIZE, 0);
+        vfh = new DFSFileHandle();
+        vfh->assign(file);
+    } else {
+        int fd = open("locafile.img", O_RDWR, 0);
+        vfh = new UnixFileHandle();
+        vfh->assign(fd);        
+    }
+    // Write some data
+    BufferedOutputStream buf(BLOCK_SIZE);
+    buf.open(vfh);
+    buf.write(someData, sizeof(someData);
+    buf.flush(true);
+
+    // Read data from the file
+    if (vph->pread(buf, size, pos, V_NOWAIT)) { 
+        ...
+    }
+</pre>
+
+DFS file is identified by its INODE table: information about location of DFS chunks.
+There are can be arbitrary number of files in DFS. But file can be written only by one process.
+Two or more processes can read the same file if them share INODE table or send part of them to each other
+needed to map used region of the file.<p>
+
+DFS client should accept connections from DFS nodes. It can be either done by client application itself: it 
+should just listens port, accepts connections, reads DFS node id (4 bytes) and invokes <code>DFS::instance.addChannel</code> method.
+Or alternatively client can use <code>DFS::instance.listen</code> method which will spawn separate thread 
+for accepting DFS node connections.<p>
+
+<h2><a name="server">DFS server</a></h2>
+
+DFS data is managed by <i>DFS servers</i>. DFS server is a process representing <i>DFS node</i>.
+It works with some physical storage device (OS file or raw partition). It is possible to run several DFS nodes at a single host.
+The desired configuration of DFS storage is a large number of inexpensive servers with minimal memory (2Gb is more than enough)
+and slow CPU. But it should contain as much HDDs as possible (usually 4 for standard 1U rack server).
+So at each such host 4 DFS servers are launched. With 100 such servers equipped with four 1Tb disks, total number of 
+DFS nodes will be 400 and total capacity - 400Tb. Taking in account redundancy (2 or 3) and reservation of space needed 
+to avoid overflow, actual storage size will be about 100Tb.<p>
+
+Below is an example of starting DFS servers:
+
+<pre>
+i=1
+j=0
+while [ $i -le $N_DFS_HOSTS ] 
+do 
+    for d in a b c d  
+    do 
+        ssh dfs$i "./dfs_server $j /dev/sd$d -clients dfs_clients.lst" &
+	j=`expr $j + 1`
+    done
+    i=`expr $i + 1`
+done
+</pre>
+
+
+The file <code>dfs_clients.lst</code> contains addresses of DFS clients.
+Address is specified in the following format: <code>NAME:PORT</code>.
+Below is an example of dfs_clients.lst file:
+
+<pre>
+mediaserver1:5001
+mediaserver2:5002
+mediaserver3:5003
+mediaserver4:5004
+</pre>
+
+You can certainly use IP address instead of name of the server.<p>
+
+In case of some host failure, all DFS servers running at it should be restarted. 
+In case of disk crash/corruption of data on the disk
+node has to be recovered. It can be done by launching dfs_server with <code>-recovery</code> flag.<p>
+
+DFS nodes can be organized in cliques. There are two purposes for it. First of all modern 
+network hardware is not able to provide equal throughput between all nodes of the cluster.
+Nodes are connected to the network through switches and typical number of nodes connected to one switch
+is about 30-50 (switches supported more connections are significantly more expensive).
+Most switches provide 100Mb throughput between any pair of nodes connected to the switch.
+But as total number of nodes in large cluster is usually more than 100 (sometimes even more than thousand),
+it is not possible to connect all nodes to one switch. And if nodes connected to different switches
+need to exchange data, then them have to share interswitch link which becomes cluster's bottleneck.
+If data stored in DFS can be split in two subsets: smaller but more frequently used and larger but 
+rarely used, it is possible to place more frequently used data at DFS nodes connected to the same switch as
+consumers of this data. For example in search engine an example of frequently accessed data is inverse index
+and speed of extraction of content of documents and images is less important. 
+In LiteDFS it can be achieved be grouping these DFS nodes in separate clique.
+The client should specify this clique identifier when writing this data to DFS.<p>
+
+Another role of clique is uniform consumption of disk space.
+LiteDFS randomly distribute chunks between all available nodes.
+So used disk space is almost the same at all nodes. But if we are close to exhaustion of cluster
+space and so add new DFS nodes, then new nodes will be filled at the same speed as old nodes,
+And it certainly leads to overflow of old nodes. To prevent this scenario it is expected that when
+old nodes are mostly filled we add new bulk of nodes and assign them new clique number.
+Then clients start to write data to the new clique, using old nodes only for retrieving data.<p>
+
+<h2><a name="usecases">Use cases</a></h2>
+This DFS was used in WebAlta search engine for storing inverse index, content of documents and images.
+Also it was used in content oriented social network Fishker to store media data.
+The provided output bandwise with 20 cheap 1U rack servers (Celeron, 2Gb RAM, 4 SATA disks) is about 150Mb/sec.
+
+<h2><a name="license">License</a></h2>
+This software is distributed under MIT license.
+
+</body>
+</html>
